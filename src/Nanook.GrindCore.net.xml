@@ -4545,6 +4545,19 @@
             <param name="nbThreads"></param>
             <returns></returns>
         </member>
+        <member name="M:Nanook.GrindCore.Interop.Lz4.SZ_Lz4_v1_10_0_CompressPartial(Nanook.GrindCore.Interop.SZ_Lz4_v1_10_0_Stream@,System.Byte*,System.IntPtr,System.Int32@,System.Int32,System.Int32)">
+            <summary>
+            Compresses as much of <paramref name="src"/> as fits in <paramref name="targetSize"/> bytes (LZ4 "destSize").
+            <paramref name="srcSize"/> is in/out: bytes available on entry, bytes consumed on return. Returns the
+            compressed size (&gt; 0) or a negative error code. The block is independent and the stream is reset afterwards.
+            </summary>
+        </member>
+        <member name="M:Nanook.GrindCore.Interop.SHA.SZ_Sha1_PrepareBlock(Nanook.GrindCore.Interop.CSha1*,System.Byte*,System.UInt32)">
+            <summary>Returns 0, or -1 if <paramref name="size"/> is not a multiple of 4 no larger than 52 (block untouched).</summary>
+        </member>
+        <member name="M:Nanook.GrindCore.Interop.SHA.SZ_SHA3_Init(Nanook.GrindCore.Interop.SHA3_CTX*,System.UInt32)">
+            <summary>Returns 0, or -1 if <paramref name="bitSize"/> is not 224, 256, 384 or 512 (context left as a harmless 0-bit digest).</summary>
+        </member>
         <member name="T:Nanook.GrindCore.Interop.ZStream">
             <summary>
             ZLib stream descriptor data structure
