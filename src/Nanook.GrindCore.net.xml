@@ -5238,6 +5238,13 @@
             <param name="minBufferSize">The minimum buffer size to use (default is 0).</param>
             <exception cref="T:System.Exception">Thrown if the encoder context or buffer cannot be allocated or configured.</exception>
         </member>
+        <member name="P:Nanook.GrindCore.Lzma.Lzma2Encoder.BatchOutputBound">
+            <summary>
+            Block mode: the most output one batch can produce, which the output buffer passed to <see cref="M:Nanook.GrindCore.Lzma.Lzma2Encoder.EncodeData(Nanook.GrindCore.CompressionBuffer,Nanook.GrindCore.CompressionBuffer,System.Boolean,Nanook.GrindCore.CancellableTask)"/>
+            must hold. 7-Zip's bound is block + block/1024 + 16 per block (Lzma2Enc.c); this rounds up generously.
+            0 in solid mode.
+            </summary>
+        </member>
         <member name="M:Nanook.GrindCore.Lzma.Lzma2Encoder.EncodeData(Nanook.GrindCore.CompressionBuffer,Nanook.GrindCore.CompressionBuffer,System.Boolean,Nanook.GrindCore.CancellableTask)">
             <summary>
             Encodes data from the input buffer into the output buffer using LZMA2 compression.
@@ -5249,6 +5256,9 @@
             <returns>The total number of bytes written to the output buffer.</returns>
             <exception cref="T:System.ArgumentException">Thrown if <paramref name="inData"/> or <paramref name="outData"/> is not at the correct position.</exception>
             <exception cref="T:System.Exception">Thrown if compression fails.</exception>
+        </member>
+        <member name="M:Nanook.GrindCore.Lzma.Lzma2Encoder.encodeBatch(Nanook.GrindCore.CompressionBuffer)">
+            <summary>One Lzma2Enc_Encode2 call on the pending batch; its 0x00 end byte is dropped (the stream writes one).</summary>
         </member>
         <member name="M:Nanook.GrindCore.Lzma.Lzma2Encoder.Dispose">
             <summary>

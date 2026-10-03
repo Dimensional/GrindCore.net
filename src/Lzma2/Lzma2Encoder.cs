@@ -21,6 +21,13 @@ namespace Nanook.GrindCore.Lzma
         private bool _blockComplete;
         private bool _needsInit = false;
 
+        // Block mode (not solid): input is collected into batches of whole 7-Zip blocks, each batch one
+        // Lzma2Enc_Encode2 call (7-Zip's MtCoder encodes its blocks in parallel), so the stream is byte-identical to
+        // one Encode2 over all the input whatever the write sizes are (audit/lzma.md 3.7).
+        private byte[]? _batch;
+        private int _batchFill;
+        private int _batchSize;
+
         /// <summary>
         /// Gets the LZMA2 property byte used for encoding.
         /// </summary>
@@ -113,32 +120,51 @@ namespace Nanook.GrindCore.Lzma
 
             // Fix: Determine solid mode properly - solid if blockSize is -1 OR if using 1 thread with auto block size
             bool isSolidMode = (blockSize == -1) || (threads == 1 && blockSize == 0);
-            
+
             // Configure LZMA2 blockSize behavior
             if (isSolidMode)
             {
+                // Solid streams go through the multi-call hook, which runs one coder and must not use 7-Zip's
+                // match-finder thread: that thread reads ahead of the caller's input (audit/lzma.md 3.7). The thread
+                // settings above give it lzmaProps.numThreads 1.
                 props.blockSize = ulong.MaxValue; // Solid mode
                 _solid = true;
                 this.BlockSize = -1; // Indicate solid mode to callers
             }
-            else if (blockSize == 0 && minBufferSize > 0)
-            {
-                props.blockSize = (ulong)minBufferSize / (ulong)threads;
-                _solid = false;
-                this.BlockSize = blockSize; // Keep original value
-            }
-            else if (blockSize > 0)
-            {
-                props.blockSize = (ulong)blockSize / (ulong)threads;
-                _solid = false;
-                this.BlockSize = blockSize; // Keep original value
-            }
             else
             {
-                // Default case: use solid mode for consistency
-                props.blockSize = ulong.MaxValue;
-                _solid = true;
-                this.BlockSize = -1;
+                // Block mode: every thread encodes blocks (MtCoder), one match-finder thread each. For streams that is
+                // faster than 7-Zip's own split (T/2 blocks x 2 match-finder threads): 8 blocks gave 7.05x and 4 x 2
+                // gave 5.72x on 8 cores (audit/lzma.md 3.7), and it keeps BlockSize's documented split into
+                // BlockSize / ThreadCount blocks.
+                props.lzmaProps.numThreads = 1;
+                props.numBlockThreads_Max = threads;
+                props.numTotalThreads = threads;
+                CLzma2EncProps probe = props;
+                probe.blockSize = blockSize > 0 ? (ulong)blockSize : 0;
+                SZ_Lzma2_v25_01_Enc_Normalize(ref probe);   // for the dictionary size the level gives
+                int blockThreads = threads;
+
+                // As documented for BlockSize: the batch is BlockSize, divided by the (block) threads into 7-Zip blocks.
+                // Auto (0, and what Lzma2Stream passes for ThreadCount > 1 without a BlockSize): BufferSize as the batch
+                // if given (the old behaviour), else one dictionary per block (at least 1 MiB). 7-Zip's own automatic
+                // block is 4 x the dictionary (128 MiB at level 5), which keeps streams under a few hundred MiB on one
+                // thread and needs batches of ~1 GiB at 8 threads; the default is Nanook's call (audit/lzma.md 3.7).
+                ulong sub;
+                if (blockSize > 0)
+                    sub = (ulong)blockSize / (ulong)blockThreads;
+                else if (minBufferSize > 0)
+                    sub = (ulong)minBufferSize / (ulong)blockThreads;
+                else
+                    sub = Math.Max(probe.lzmaProps.dictSize, 1UL << 20);
+                if (sub < (1 << 16))
+                    sub = 1 << 16;
+                const long MaxBatch = 1L << 30;   // a 32-bit process can't hold more; MtCoder still uses every block thread
+                int blocksPerBatch = (int)Math.Max(1, Math.Min(blockThreads, MaxBatch / (long)sub));
+                props.blockSize = sub;
+                _batchSize = (int)Math.Min(MaxBatch, (long)sub * blocksPerBatch);
+                _solid = false;
+                this.BlockSize = blockSize; // Keep original value
             }
 
             // CRITICAL: Let native normalization set optimal values - DO NOT override afterwards!
@@ -159,6 +185,15 @@ namespace Nanook.GrindCore.Lzma
 
             this.Properties = SZ_Lzma2_v25_01_Enc_WriteProperties(_encoder);
 
+            if (!_solid)
+            {
+                // Block mode never uses the multi-call hook (whose Prepare would allocate a solid coder's dictionary)
+                _batch = BufferPool.Rent(_batchSize);
+                _batchFill = 0;
+                _inBuffer = new byte[0];   // (no Array.Empty on net20-net45)
+                return;
+            }
+
             long bufferSize = (_solid || this.BlockSize > int.MaxValue ? 0x400000L : this.BlockSize) + 0x8;
 
             _inBuffer = BufferPool.Rent(bufferSize);
@@ -169,6 +204,13 @@ namespace Nanook.GrindCore.Lzma
 
             SZ_Lzma2_v25_01_Enc_EncodeMultiCallPrepare(_encoder);
         }
+
+        /// <summary>
+        /// Block mode: the most output one batch can produce, which the output buffer passed to <see cref="EncodeData"/>
+        /// must hold. 7-Zip's bound is block + block/1024 + 16 per block (Lzma2Enc.c); this rounds up generously.
+        /// 0 in solid mode.
+        /// </summary>
+        public int BatchOutputBound => _solid ? 0 : (int)Math.Min(int.MaxValue, (long)_batchSize + (_batchSize >> 9) + (1 << 16));
 
         private static int Clamp(int v, int min, int max) => v < min ? min : (v > max ? max : v);
 
@@ -213,35 +255,48 @@ namespace Nanook.GrindCore.Lzma
 
         private int encodeDataMt(CompressionBuffer inData, CompressionBuffer outData, bool final, CancellableTask cancel)
         {
-            UIntPtr outSz = (UIntPtr)outData.AvailableWrite;
-            uint available = (uint)inData.AvailableRead;
-            fixed (byte* outPtr = outData.Data)
-            fixed (byte* inPtr = inData.Data)
+            // Collect whole batches; encode each as it fills, and on a final call (Flush/Complete) the partial one too.
+            // A flush therefore ends the current blocks early: everything so far is decodable, and the stream goes on
+            // with a dictionary reset, as every block starts with one. A batch is encoded only when outData has room
+            // for its worst case (outData is empty on entry and holds at least one, see BatchOutputBound), so every
+            // call makes progress; input left unread stays in the caller's buffer for the next call.
+            int total = 0;
+            while (true)
             {
-                *&outPtr += outData.Size;
-                *&inPtr += inData.Pos;
-                int res = SZ_Lzma2_v25_01_Enc_Encode2(_encoder, outPtr, &outSz, inPtr, (UIntPtr)inData.AvailableRead, IntPtr.Zero);
-
-                outSz = (UIntPtr)((ulong)outSz - 1); //remove the null terminator from block-based compression
-
-                // Handle insufficient buffer error gracefully like LzmaEncoder
-                if (res == -2147023537) // ERROR_INSUFFICIENT_BUFFER (0x8007054F)
+                cancel.ThrowIfCancellationRequested();
+                bool ready = _batchFill == _batchSize || (final && inData.AvailableRead == 0 && _batchFill > 0);
+                if (ready)
                 {
-                    // Return partial result - this is normal for higher compression levels
-                    outData.Write((int)(ulong)outSz);
-                    inData.Read(Math.Min(inData.AvailableRead, (int)available));
-                    return (int)(ulong)outSz;
+                    if (outData.AvailableWrite < BatchOutputBound)
+                        break;
+                    total += encodeBatch(outData);
+                    continue;
                 }
-
-                outData.Write((int)(ulong)outSz);
-
-                if (res != 0)
-                    throw new Exception($"Encode Error {res}");
+                if (inData.AvailableRead == 0)
+                    break;
+                int n = Math.Min(inData.AvailableRead, _batchSize - _batchFill);
+                inData.Read(_batch!, _batchFill, n);
+                _batchFill += n;
             }
+            return total;
+        }
 
-            inData.Read(inData.AvailableRead);
-
-            return (int)(ulong)outSz;
+        /// <summary>One Lzma2Enc_Encode2 call on the pending batch; its 0x00 end byte is dropped (the stream writes one).</summary>
+        private int encodeBatch(CompressionBuffer outData)
+        {
+            UIntPtr outSz = (UIntPtr)outData.AvailableWrite;
+            int res;
+            fixed (byte* outPtr = outData.Data)
+            fixed (byte* inPtr = _batch)
+                res = SZ_Lzma2_v25_01_Enc_Encode2(_encoder, outPtr + outData.Size, &outSz, inPtr, (UIntPtr)_batchFill, IntPtr.Zero);
+            ulong produced = (ulong)outSz;
+            if (res != 0)
+                throw new Exception($"Encode Error {res}");
+            if (produced == 0 || outData.Data[outData.Size + (int)produced - 1] != 0)
+                throw new Exception($"Encode Error: Lzma2Enc_Encode2 wrote {produced} bytes without the end byte");
+            _batchFill = 0;
+            outData.Write((int)produced - 1);
+            return (int)produced - 1;
         }
 
         private int encodeDataSolid(CompressionBuffer inData, CompressionBuffer outData, bool final, CancellableTask cancel)
@@ -354,7 +409,13 @@ namespace Nanook.GrindCore.Lzma
             }
             if (_inBufferPinned.IsAllocated)
                 _inBufferPinned.Free();
-            BufferPool.Return(_inBuffer);
+            if (_inBuffer != null && _inBuffer.Length != 0)
+                BufferPool.Return(_inBuffer);
+            if (_batch != null)
+            {
+                BufferPool.Return(_batch);
+                _batch = null;
+            }
         }
     }
 }

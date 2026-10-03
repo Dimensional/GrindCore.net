@@ -94,14 +94,22 @@ namespace Nanook.GrindCore.Lzma
                 // Fix: Pass proper parameters for solid mode
                 // Solid mode should be used when: blockSize == -1 OR (threadCount == 1 AND blockSize == 0)
                 int threads = options?.ThreadCount ?? 1;
-                long blockSize = options?.BlockSize ?? -1;
+                // Without a BlockSize, ThreadCount > 1 means blocks of automatic size (it used to stay solid, on one
+                // thread: the solid path is the multi-call hook, which has one coder). An explicit -1 stays solid.
+                long blockSize = options?.BlockSize ?? (threads > 1 ? 0 : -1);
 
                 // Default to solid mode for single-threaded LZMA2 (matches 7-Zip behavior)
                 if (threads == 1 && blockSize == 0)
                     blockSize = -1;
 
                 // Pass merged dictionary options and thread/block settings into encoder.
-                _encoder = new Lzma2Encoder((int)CompressionType, threads, blockSize, merged, options?.BufferSize ?? 0);
+                // BufferSize sizes the batch only for an explicit BlockSize of 0 (auto), as before
+                _encoder = new Lzma2Encoder((int)CompressionType, threads, blockSize, merged,
+                    options?.BlockSize == 0 ? options?.BufferSize ?? 0 : 0);
+
+                // Block mode encodes whole batches, so the output buffer must hold one batch's worst case
+                if (_encoder.BatchOutputBound > this.BufferSizeOutput)
+                    this.BufferSizeOutput = _encoder.BatchOutputBound;
 
                 this.Properties = new byte[] { _encoder.Properties };
                 _buffer = new CompressionBuffer(this.BufferSizeOutput);
