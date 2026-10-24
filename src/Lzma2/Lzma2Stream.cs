@@ -197,7 +197,7 @@ namespace Nanook.GrindCore.Lzma
             bytesWrittenToStream = 0;
             cancel.ThrowIfCancellationRequested();
             int avRead = data.AvailableRead;
-            long size = _encoder.EncodeData(data, _buffer, false, cancel);
+            long size = _encoder.EncodeData(data, _buffer, false, false, cancel);
 
             if (size > 0)
             {
@@ -223,7 +223,8 @@ namespace Nanook.GrindCore.Lzma
                 while (true)
                 {
                     cancel.ThrowIfCancellationRequested();
-                    long size = _encoder.EncodeData(data, _buffer, true, cancel);
+                    // a Flush() is a sync flush: the stream goes on afterwards (audit/lzma.md 3.1)
+                    long size = _encoder.EncodeData(data, _buffer, true, !complete, cancel);
                     if (size == 0)
                         break;
                     BaseWrite(_buffer, _buffer.AvailableRead);
@@ -322,7 +323,7 @@ namespace Nanook.GrindCore.Lzma
             int bytesWrittenToStream = 0;
             cancellationToken.ThrowIfCancellationRequested();
             int avRead = data.AvailableRead;
-            long size = _encoder.EncodeData(data, _buffer, false, new CancellableTask(cancellationToken));
+            long size = _encoder.EncodeData(data, _buffer, false, false, new CancellableTask(cancellationToken));
 
             if (size > 0)
             {
@@ -352,7 +353,7 @@ namespace Nanook.GrindCore.Lzma
                 while (true)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    long size = _encoder.EncodeData(data, _buffer, true, new CancellableTask(cancellationToken));
+                    long size = _encoder.EncodeData(data, _buffer, true, !complete, new CancellableTask(cancellationToken));
                     if (size == 0)
                         break;
                     await BaseWriteAsync(_buffer, _buffer.AvailableRead, cancellationToken).ConfigureAwait(false);

@@ -226,11 +226,14 @@ namespace Nanook.GrindCore.Lzma
         /// <param name="inData">The input buffer containing data to compress.</param>
         /// <param name="outData">The output buffer to write compressed data to.</param>
         /// <param name="final">Indicates if this is the final block of data.</param>
+        /// <param name="syncFlush">With <paramref name="final"/>: a Flush() rather than the end. In solid mode the stream
+        /// then goes on after the flushed data with its dictionary (the native sync flush, audit/lzma.md 3.1); block mode
+        /// ends its blocks either way.</param>
         /// <param name="cancel">A cancellable task for cooperative cancellation.</param>
         /// <returns>The total number of bytes written to the output buffer.</returns>
         /// <exception cref="ArgumentException">Thrown if <paramref name="inData"/> or <paramref name="outData"/> is not at the correct position.</exception>
         /// <exception cref="Exception">Thrown if compression fails.</exception>
-        public int EncodeData(CompressionBuffer inData, CompressionBuffer outData, bool final, CancellableTask cancel)
+        public int EncodeData(CompressionBuffer inData, CompressionBuffer outData, bool final, bool syncFlush, CancellableTask cancel)
         {
             inData.Tidy();
             outData.Tidy();
@@ -248,7 +251,7 @@ namespace Nanook.GrindCore.Lzma
             }
 
             if (_solid)
-                return encodeDataSolid(inData, outData, final, cancel);
+                return encodeDataSolid(inData, outData, final, final && syncFlush ? Lzma2SyncFlush : 0u, cancel);
             else
                 return encodeDataMt(inData, outData, final, cancel);
         }
@@ -299,7 +302,10 @@ namespace Nanook.GrindCore.Lzma
             return (int)produced - 1;
         }
 
-        private int encodeDataSolid(CompressionBuffer inData, CompressionBuffer outData, bool final, CancellableTask cancel)
+        // flags: Lzma2SyncFlush on the calls that drain the input for a Flush(). Without it, input written after a
+        // flush was lost (the native latch, audit/lzma.md 3.1); with it, the native side resumes the match finder after
+        // the flushed data, keeping the dictionary, as liblzma's LZMA_SYNC_FLUSH does.
+        private int encodeDataSolid(CompressionBuffer inData, CompressionBuffer outData, bool final, uint flags, CancellableTask cancel)
         {
             long inTotal = 0;
             int res = 0;
@@ -345,7 +351,7 @@ namespace Nanook.GrindCore.Lzma
                         outSz = (UIntPtr)outData.AvailableWrite;
                         byte* outPtr2 = *&outPtr + outData.Size;
                         _blockComplete = finalfinal || blkFinal;
-                        res = SZ_Lzma2_v25_01_Enc_EncodeMultiCall(_encoder, outPtr2, &outSz, ref _inStream, 0u);
+                        res = SZ_Lzma2_v25_01_Enc_EncodeMultiCall(_encoder, outPtr2, &outSz, ref _inStream, flags);
                         outTotal += (int)(ulong)outSz;
 
                         // Handle insufficient buffer error gracefully like LzmaEncoder
