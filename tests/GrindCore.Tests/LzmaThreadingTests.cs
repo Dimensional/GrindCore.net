@@ -47,8 +47,18 @@ namespace GrindCore.Tests
             return ms.ToArray().Take(n).ToArray();
         }
 
+        // At most 2 threads in a 32-bit process. Each block thread has its own 7-Zip encoder (about 400 MB at Level5's
+        // 32 MiB dictionary), and 8 or 16 threads without a BlockSize make Lzma2Stream rent batch buffers of 256-512 MiB:
+        // together more than 2 GB of address space holds (the GrindCore audit's lzma.md 3.7.2).
+        private static int? Threads(int? threads) =>
+#if IS_32BIT
+            threads > 2 ? 2 : threads;
+#else
+            threads;
+#endif
+
         private static CompressionOptions Options(int? threads, long? blockSize, int? bufferSize = null) =>
-            new CompressionOptions { Type = CompressionType.Level5, LeaveOpen = true, ThreadCount = threads, BlockSize = blockSize, BufferSize = bufferSize };
+            new CompressionOptions { Type = CompressionType.Level5, LeaveOpen = true, ThreadCount = Threads(threads), BlockSize = blockSize, BufferSize = bufferSize };
 
         private static (byte[] compressed, byte[] props) Encode(byte[] data, CompressionOptions o, int writeSize, int flushAt = -1)
         {
@@ -152,14 +162,20 @@ namespace GrindCore.Tests
         [Fact]
         public void Lzma2Stream_ThreadCount_Speed()
         {
+#if IS_32BIT
+            // 16 MiB in a 32-bit process: on 64 MiB, each step's buffers and encoders together outgrow its 2 GB (lzma.md 3.7.2)
+            byte[] data = Mixed(16 << 20, 5);
+#else
             byte[] data = Mixed(64 << 20, 5);
+#endif
             foreach (var (threads, block) in new (int?, long?)[] { (null, null), (8, null), (16, null), (8, 32L << 20) })
             {
+                var o = Options(threads, block);
                 var sw = Stopwatch.StartNew();
-                var (c, p) = Encode(data, Options(threads, block), 1 << 20);
+                var (c, p) = Encode(data, o, 1 << 20);
                 double sec = sw.Elapsed.TotalSeconds;
                 bool ok = Decode(c, p).AsSpan().SequenceEqual(data);
-                _out.WriteLine($"ThreadCount {threads?.ToString() ?? "-"}, BlockSize {block?.ToString() ?? "-"}: {sec:F2} s, " +
+                _out.WriteLine($"ThreadCount {o.ThreadCount?.ToString() ?? "-"}, BlockSize {block?.ToString() ?? "-"}: {sec:F2} s, " +
                                $"{data.Length / sec / (1 << 20):F1} MiB/s, ratio {(double)c.Length / data.Length:F5}, decodes {ok}");
                 Assert.True(ok);
             }
