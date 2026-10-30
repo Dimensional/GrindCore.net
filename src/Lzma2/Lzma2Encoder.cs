@@ -20,6 +20,7 @@ namespace Nanook.GrindCore.Lzma
         private long _blkTotal;
         private bool _blockComplete;
         private bool _needsInit = false;
+        private bool _prepared; // the solid encoder's last EncodeMultiCallPrepare succeeded (audit/lzma.md 3.11)
 
         // Block mode (not solid): input is collected into batches of whole 7-Zip blocks, each batch one
         // Lzma2Enc_Encode2 call (7-Zip's MtCoder encodes its blocks in parallel), so the stream is byte-identical to
@@ -202,7 +203,26 @@ namespace Nanook.GrindCore.Lzma
             _inStream = new CBufferInStream() { buffer = _inBufferPinned.AddrOfPinnedObject(), size = (ulong)bufferSize };
             _blkTotal = 0;
 
-            SZ_Lzma2_v25_01_Enc_EncodeMultiCallPrepare(_encoder);
+            try
+            {
+                prepare();
+            }
+            catch
+            {
+                Dispose();
+                throw;
+            }
+        }
+
+        // EncodeMultiCallPrepare allocates the solid encoder's match finder and window. When it can't (SZ_ERROR_MEM, as in
+        // a 32-bit process short of address space), EncodeMultiCall would write through the half-built encoder's
+        // pointers, so a failure has to stop here (audit/lzma.md 3.11).
+        private void prepare()
+        {
+            int res = SZ_Lzma2_v25_01_Enc_EncodeMultiCallPrepare(_encoder);
+            _prepared = res == 0;
+            if (res != 0)
+                throw new Exception($"Failed to prepare LZMA2 encoder {res}");
         }
 
         /// <summary>
@@ -246,7 +266,7 @@ namespace Nanook.GrindCore.Lzma
             // Lazy preparation: only prepare if we need to AND have data to process
             if (_needsInit && (inData.AvailableRead > 0 || final))
             {
-                SZ_Lzma2_v25_01_Enc_EncodeMultiCallPrepare(_encoder);
+                prepare();
                 _needsInit = false;
             }
 
@@ -394,17 +414,22 @@ namespace Nanook.GrindCore.Lzma
             {
                 if (_needsInit)
                 {
-                    SZ_Lzma2_v25_01_Enc_EncodeMultiCallPrepare(_encoder);
+                    _prepared = SZ_Lzma2_v25_01_Enc_EncodeMultiCallPrepare(_encoder) == 0;
                     _needsInit = false;
                 }
 
-                byte[] dummy = new byte[1]; // Ensure we have space for EOF marker
-                UIntPtr outSize = (UIntPtr)1;
-                fixed (byte* d = dummy)
+                // Without a prepared encoder there is nothing to finalise, and EncodeMultiCall would write through its
+                // unset pointers (audit/lzma.md 3.11); Dispose doesn't throw
+                if (_prepared)
                 {
-                    int res = SZ_Lzma2_v25_01_Enc_EncodeMultiCall(_encoder, d, &outSize, ref _inStream, 0u);
-                    if (res == 0) // Only set to complete if finalization succeeded
-                        _blockComplete = true;
+                    byte[] dummy = new byte[1]; // Ensure we have space for EOF marker
+                    UIntPtr outSize = (UIntPtr)1;
+                    fixed (byte* d = dummy)
+                    {
+                        int res = SZ_Lzma2_v25_01_Enc_EncodeMultiCall(_encoder, d, &outSize, ref _inStream, 0u);
+                        if (res == 0) // Only set to complete if finalization succeeded
+                            _blockComplete = true;
+                    }
                 }
             }
 
